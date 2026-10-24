@@ -1,0 +1,193 @@
+name: url-shortener
+
+# ---------------------------------------------------------------------------
+# Shared backend environment (values are interpolated from .env if present)
+# ---------------------------------------------------------------------------
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-shortener}:${POSTGRES_PASSWORD:-shortener}@postgres:5432/${POSTGRES_DB:-shortener}
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+  BASE_URL: ${BASE_URL:-http://localhost:8080}
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DEBUG: ${DEBUG:-false}
+  ANONYMOUS_LINK_TTL_SECONDS: ${ANONYMOUS_LINK_TTL_SECONDS:-604800}
+  URL_HTTP_CHECK_ENABLED: ${URL_HTTP_CHECK_ENABLED:-true}
+  ALLOW_PRIVATE_HOSTS: ${ALLOW_PRIVATE_HOSTS:-false}
+  RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+  LINK_CREATION_RATE_LIMIT: ${LINK_CREATION_RATE_LIMIT:-10/minute}
+  CORS_ORIGINS: '["http://localhost:8080","http://localhost:5173"]'
+
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+  environment: *backend-env
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 15s
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------- data layer
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shortener}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shortener}
+      POSTGRES_DB: ${POSTGRES_DB:-shortener}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shortener} -d ${POSTGRES_DB:-shortener}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      # Every anonymous link has a TTL, so volatile-lru never evicts keys that
+      # could otherwise live forever.
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ------------------------------------------------------------- migrations
+  migrate:
+    build:
+      context: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # --------------------------------------------------------- backend replicas
+  backend_1:
+    <<: *backend-base
+  backend_2:
+    <<: *backend-base
+
+  # -------------------------------------------------------- frontend builder
+  # Builds the Vite bundle once and copies it into a shared volume that Nginx
+  # serves as static files.
+  frontend_build:
+    build:
+      context: ./frontend
+      target: build
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /usr/share/nginx/html &&
+        rm -rf /usr/share/nginx/html/* &&
+        cp -r /app/dist/. /usr/share/nginx/html/ &&
+        echo "frontend bundle published to shared volume"
+    volumes:
+      - frontend_dist:/usr/share/nginx/html
+    restart: "no"
+
+  # ------------------------------------------------- load balancer + static
+  nginx:
+    # 1.27.3+ is required for "server ... resolve" in an upstream block.
+    image: nginx:1.27.5-alpine
+    # Invoke through sh so the mount does not need an executable bit.
+    entrypoint: ["/bin/sh", "/docker-entrypoint-wrapper.sh"]
+    # Explicit CMD: some Compose providers drop the image CMD when the
+    # entrypoint is overridden, which would make the container exit silently.
+    command: ["nginx", "-g", "daemon off;"]
+    environment:
+      # The wrapper auto-detects the runtime DNS server when this is empty.
+      NGINX_RESOLVER: ${NGINX_RESOLVER:-}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+    # Nginx stays private.  The browser-facing port is owned by the small
+    # TCP/MSS proxy below, which works around a broken large-segment path on
+    # this host.  On a healthy host the proxy is still transparent.
+    ports:
+      - "127.0.0.1:${NGINX_INTERNAL_PORT:-8081}:80"
+    volumes:
+      # :Z keeps SELinux hosts (Fedora/RHEL) happy; Docker ignores it.
+      - ./nginx/templates:/etc/nginx/templates:ro,Z
+      - ./nginx/docker-entrypoint-wrapper.sh:/docker-entrypoint-wrapper.sh:ro,Z
+      - frontend_dist:/usr/share/nginx/html:ro
+    depends_on:
+      backend_1:
+        condition: service_healthy
+      backend_2:
+        condition: service_healthy
+      frontend_build:
+        condition: service_completed_successfully
+    healthcheck:
+      # Port 80 speaks PROXY protocol; use the internal plain-HTTP listener.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ------------------------------------------- browser-facing MSS workaround
+  # The loopback interface on this host has a 64 KiB MTU and Podman's rootless
+  # port forwarder inherits it.  This kernel drops the resulting multi-KiB TCP
+  # segments: responses larger than ~12 KiB (including the Vite JS bundle)
+  # hang forever even though Nginx logs a 200.  The proxy owns the socket that
+  # faces the browser and advertises a 1200-byte MSS on both legs, so every
+  # segment is small enough to be delivered.  It is a plain TCP forwarder:
+  # Nginx still serves the SPA and balances the API.
+  #
+  # network_mode: host is required for the proxy to own the host-side socket.
+  # On a machine without the loopback bug this service still works, but it can
+  # be disabled together with the port change above if desired.
+  proxy:
+    image: python:3.12-alpine
+    network_mode: host
+    environment:
+      PROXY_LISTEN_PORT: ${APP_PORT:-8080}
+      PROXY_TARGET_HOST: 127.0.0.1
+      PROXY_TARGET_PORT: ${NGINX_INTERNAL_PORT:-8081}
+      PROXY_MSS: ${PROXY_MSS:-1200}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./proxy/loopback_proxy.py:/proxy/loopback_proxy.py:ro,Z
+    command: ["python", "-u", "/proxy/loopback_proxy.py"]
+    depends_on:
+      nginx:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  frontend_dist:
+
+networks:
+  # Keep container-to-container traffic below the same broken segment size.
+  # The proxy fixes the browser-facing leg; this fixes backend <-> Nginx.
+  default:
+    driver: bridge
+    driver_opts:
+      # Docker-standard key; Podman/netavark understands it too and maps it to
+      # the bridge MTU.  Keeps this file portable across both runtimes.
+      com.docker.network.driver.mtu: "1500"

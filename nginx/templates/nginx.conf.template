@@ -1,0 +1,156 @@
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 2048;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    sendfile on;
+    tcp_nopush on;
+    keepalive_timeout 65;
+    server_tokens off;
+    client_max_body_size 2m;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                    'upstream=$upstream_addr rt=$request_time';
+    access_log /var/log/nginx/access.log main;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript
+               application/xml image/svg+xml;
+
+    # ------------------------------------------------------------------
+    # Rate limiting at the edge (FastAPI/slowapi enforces its own quota too).
+    # Anonymous link creation is limited per client IP.
+    # ------------------------------------------------------------------
+    limit_req_zone $binary_remote_addr zone=link_create:10m rate=20r/m;
+    limit_conn_zone $binary_remote_addr zone=per_ip:10m;
+    limit_req_status 429;
+    limit_conn_status 429;
+
+    # Dynamic DNS resolution: Nginx re-resolves the Compose service names, so
+    # recreating a backend container (new IP) does not require restarting Nginx.
+    # NGINX_RESOLVER is injected by the entrypoint wrapper (Docker: 127.0.0.11,
+    # Podman: the DNS server from /etc/resolv.conf).
+    resolver ${NGINX_RESOLVER} valid=10s ipv6=off;
+    resolver_timeout 2s;
+
+    # The local TCP/MSS proxy sends PROXY v1 headers.  Trust it (and the
+    # container network it arrives through) so $remote_addr, rate limiting and
+    # analytics keep using the real browser address.
+    set_real_ip_from 127.0.0.1;
+    # Podman/pasta and Docker bridge gateways (the proxy connects through the
+    # published port, so the direct peer is the runtime's gateway).
+    set_real_ip_from 10.0.0.0/8;
+    set_real_ip_from 172.16.0.0/12;
+    real_ip_header proxy_protocol;
+
+    upstream backend_upstream {
+        zone backend_upstream 64k;
+        least_conn;
+        server backend_1:8000 resolve max_fails=3 fail_timeout=15s;
+        server backend_2:8000 resolve max_fails=3 fail_timeout=15s;
+        keepalive 32;
+    }
+
+    server {
+        # The browser-facing TCP/MSS proxy (see proxy/loopback_proxy.py) sends
+        # a PROXY v1 header, so Nginx keeps seeing the real client address.
+        # Port 8080 is an internal, header-less listener used by health checks
+        # and by anyone debugging inside the container.
+        listen 80 proxy_protocol;
+        listen 8080;
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # ------------------------------------------------------- health
+        location = /healthz {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        # ------------------------------------ create-link endpoint (throttled)
+        location = /api/v1/links {
+            limit_req zone=link_create burst=5 nodelay;
+            limit_conn per_ip 20;
+
+            proxy_pass http://backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header Connection "";
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 60s;
+        }
+
+        # -------------------------------------------------------- API
+        location /api/ {
+            proxy_pass http://backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header Connection "";
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 60s;
+            proxy_send_timeout 60s;
+        }
+
+        # -------------------------------------------- short-link redirects
+        location /l/ {
+            proxy_pass http://backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection "";
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 30s;
+        }
+
+        # ---------------------------------------------- static Vite assets
+        location /assets/ {
+            try_files $uri =404;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            access_log off;
+        }
+
+        # Never cache the SPA entry point, otherwise new deployments are not
+        # picked up by browsers that already visited the app.
+        location = /index.html {
+            add_header Cache-Control "no-cache, no-store, must-revalidate";
+        }
+
+        # ---------------------------------------------------------- SPA
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        # Named location avoids an internal redirect loop when the upstream
+        # itself answers 503.
+        error_page 500 502 503 504 = @maintenance;
+        location @maintenance {
+            default_type text/html;
+            return 503 "<!doctype html><title>Service unavailable</title><h1>503</h1><p>The service is temporarily unavailable.</p>";
+        }
+    }
+}
